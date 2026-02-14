@@ -1,8 +1,10 @@
+# app.py
 import io
 import json
 import csv
 import zipfile
 import tempfile
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -186,6 +188,23 @@ def _extract_sleep_row(ev: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     else:
         num_awakenings = int(wake_count)
 
+    # ----- staged vs classic handling -----
+    sleep_type = str(ev.get("type") or "").strip().lower()
+    is_staged = sleep_type in {"stages", "staged"}
+
+    # If type missing, infer from keys
+    if not sleep_type:
+        is_staged = any(k in summary for k in ["rem", "light", "deep"])
+
+    if is_staged:
+        rem_min = int((summary.get("rem") or {}).get("minutes") or 0)
+        light_min = int((summary.get("light") or {}).get("minutes") or 0)
+        deep_min = int((summary.get("deep") or {}).get("minutes") or 0)
+    else:
+        rem_min = "N/A"
+        light_min = "N/A"
+        deep_min = "N/A"
+
     return {
         "Start Time": _fmt_dt_sleep(start),
         "End Time": _fmt_dt_sleep(end),
@@ -193,9 +212,9 @@ def _extract_sleep_row(ev: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "Minutes Awake": int(ev.get("minutesAwake") or 0),
         "Number of Awakenings": int(num_awakenings),
         "Time in Bed": int(ev.get("timeInBed") or 0),
-        "Minutes REM Sleep": int((summary.get("rem") or {}).get("minutes") or 0),
-        "Minutes Light Sleep": int((summary.get("light") or {}).get("minutes") or 0),
-        "Minutes Deep Sleep": int((summary.get("deep") or {}).get("minutes") or 0),
+        "Minutes REM Sleep": rem_min,
+        "Minutes Light Sleep": light_min,
+        "Minutes Deep Sleep": deep_min,
         "_start_dt": start,
         "_logId": ev.get("logId", None),
     }
@@ -258,7 +277,13 @@ def _filter_daily_by_range(df: pd.DataFrame, start: pd.Timestamp, end: pd.Timest
     return df.loc[(d >= start) & (d <= end)].copy()
 
 
-def build_outputs(global_folder: Path, intersect_dates: bool = True) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[Tuple[pd.Timestamp, pd.Timestamp]]]:
+def build_outputs(
+    global_folder: Path,
+    intersect_dates: bool = True,
+    user_start: Optional[pd.Timestamp] = None,
+    user_end: Optional[pd.Timestamp] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[Tuple[pd.Timestamp, pd.Timestamp]]]:
+
     steps = metric_daily_sum(collect_prefix_files(global_folder, "steps"), "Steps", round_int=True)
     cal_act = build_daily_calories_and_activity(global_folder)
     dist = metric_daily_sum(collect_prefix_files(global_folder, "distance"), "Distance", value_transform=cm_to_miles)
@@ -270,13 +295,23 @@ def build_outputs(global_folder: Path, intersect_dates: bool = True) -> Tuple[pd
 
     sleep_raw = build_sleep_table(global_folder)
 
+    # Normalize user range (inclusive)
+    user_range = None
+    if user_start is not None and user_end is not None:
+        us = pd.to_datetime(user_start, errors="coerce")
+        ue = pd.to_datetime(user_end, errors="coerce")
+        if not pd.isna(us) and not pd.isna(ue):
+            user_range = (us.normalize(), ue.normalize())
+
     date_range = None
+
     if intersect_dates:
         ranges: List[Tuple[pd.Timestamp, pd.Timestamp]] = []
         for d in [steps, cal_act, dist, sed, light, mod, vig]:
             r = _range_from_daily(d, "date")
             if r:
                 ranges.append(r)
+
         if not sleep_raw.empty:
             sd = sleep_raw["_start_dt"].dropna()
             if not sd.empty:
@@ -285,6 +320,12 @@ def build_outputs(global_folder: Path, intersect_dates: bool = True) -> Tuple[pd
         date_range = _intersect_ranges(ranges)
         if date_range is None:
             return pd.DataFrame(), pd.DataFrame(), None
+
+        # intersect with user range if provided
+        if user_range is not None:
+            date_range = _intersect_ranges([date_range, user_range])
+            if date_range is None:
+                return pd.DataFrame(), pd.DataFrame(), None
 
         start, end = date_range
         steps = _filter_daily_by_range(steps, start, end)
@@ -299,6 +340,25 @@ def build_outputs(global_folder: Path, intersect_dates: bool = True) -> Tuple[pd
             sd = sleep_raw["_start_dt"].dt.normalize()
             sleep_raw = sleep_raw.loc[(sd >= start) & (sd <= end)].copy()
 
+    else:
+        # only apply user range (if provided)
+        if user_range is not None:
+            start, end = user_range
+            steps = _filter_daily_by_range(steps, start, end)
+            cal_act = _filter_daily_by_range(cal_act, start, end)
+            dist = _filter_daily_by_range(dist, start, end)
+            sed = _filter_daily_by_range(sed, start, end)
+            light = _filter_daily_by_range(light, start, end)
+            mod = _filter_daily_by_range(mod, start, end)
+            vig = _filter_daily_by_range(vig, start, end)
+
+            if not sleep_raw.empty:
+                sd = sleep_raw["_start_dt"].dt.normalize()
+                sleep_raw = sleep_raw.loc[(sd >= start) & (sd <= end)].copy()
+
+        date_range = user_range
+
+    # Combine activity
     dfs = [steps, cal_act, dist, sed, light, mod, vig]
     combined = None
     for d in dfs:
@@ -330,6 +390,7 @@ def build_outputs(global_folder: Path, intersect_dates: bool = True) -> Tuple[pd
         combined["Distance"] = combined["Distance"].astype(float)
         activity_df = combined[garmin_cols].sort_values("Date")
 
+    # Sleep output
     sleep_cols = [
         "Start Time", "End Time", "Minutes Asleep", "Minutes Awake",
         "Number of Awakenings", "Time in Bed",
@@ -338,7 +399,11 @@ def build_outputs(global_folder: Path, intersect_dates: bool = True) -> Tuple[pd
     if sleep_raw.empty:
         sleep_df = pd.DataFrame(columns=sleep_cols)
     else:
-        sleep_df = sleep_raw.sort_values("_start_dt", ascending=True).drop(columns=["_start_dt"]).reset_index(drop=True)
+        sleep_df = (
+            sleep_raw.sort_values("_start_dt", ascending=True)
+                    .drop(columns=["_start_dt"])
+                    .reset_index(drop=True)
+        )
 
     return activity_df, sleep_df, date_range
 
@@ -366,15 +431,32 @@ def write_combined_csv_bytes(activity_df: pd.DataFrame, sleep_df: pd.DataFrame) 
     return buf.getvalue().encode("utf-8")
 
 
-def convert_takeout_zip_bytes(zip_bytes: bytes, intersect_dates: bool = True) -> Tuple[bytes, pd.DataFrame, pd.DataFrame, Optional[Tuple[pd.Timestamp, pd.Timestamp]]]:
+def convert_takeout_zip_bytes(
+    zip_bytes: bytes,
+    intersect_dates: bool = True,
+    user_start: Optional[pd.Timestamp] = None,
+    user_end: Optional[pd.Timestamp] = None,
+) -> Tuple[bytes, pd.DataFrame, pd.DataFrame, Optional[Tuple[pd.Timestamp, pd.Timestamp]]]:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as z:
             z.extractall(root)
         global_folder = find_global_export_data_folder(root)
-        activity_df, sleep_df, date_range = build_outputs(global_folder, intersect_dates=intersect_dates)
+        activity_df, sleep_df, date_range = build_outputs(
+            global_folder,
+            intersect_dates=intersect_dates,
+            user_start=user_start,
+            user_end=user_end,
+        )
         out_bytes = write_combined_csv_bytes(activity_df, sleep_df)
         return out_bytes, activity_df, sleep_df, date_range
+
+
+def _sanitize_filename_part(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(r"[^A-Za-z0-9_\-]+", "", s)
+    return s or "UNKNOWN"
 
 
 # -----------------------
@@ -383,31 +465,62 @@ def convert_takeout_zip_bytes(zip_bytes: bytes, intersect_dates: bool = True) ->
 st.set_page_config(page_title="Fitbit Takeout → CSV", layout="centered")
 st.title("Fitbit Takeout → CSV")
 
-uploaded = st.file_uploader("Upload Google Takeout zip", type=["zip"])
-intersect = st.checkbox("Keep only intersection date range across domains", value=True)
+with st.form("inputs", clear_on_submit=False):
+    participant_id = st.text_input("Participant ID", value="")
+    day1 = st.date_input("Day1 Set up / Start Date")
+    returned = st.date_input("Box Returned Date")
+    intersect = st.checkbox("Keep only intersection date range across domains", value=True)
+    uploaded = st.file_uploader("Upload Google Takeout zip", type=["zip"])
+    submitted = st.form_submit_button("Process")
 
-if uploaded is not None:
+if submitted:
+    if uploaded is None:
+        st.error("Please upload a Google Takeout zip.")
+        st.stop()
+
+    if not participant_id.strip():
+        st.error("Please enter Participant ID.")
+        st.stop()
+
+    if day1 > returned:
+        st.error("Start Date must be on or before Returned Date.")
+        st.stop()
+
     try:
-        out_bytes, act_df, slp_df, dr = convert_takeout_zip_bytes(uploaded.getvalue(), intersect_dates=intersect)
+        user_start = pd.Timestamp(day1)
+        user_end = pd.Timestamp(returned)
+
+        out_bytes, act_df, slp_df, dr = convert_takeout_zip_bytes(
+            uploaded.getvalue(),
+            intersect_dates=intersect,
+            user_start=user_start,
+            user_end=user_end,
+        )
 
         if out_bytes == b"":
-            st.warning("No usable activity or sleep records found.")
+            st.warning("No usable activity or sleep records found in the selected date range.")
+            st.stop()
+
+        if dr is not None:
+            st.caption(f"Output date range: {dr[0].date()} to {dr[1].date()}")
         else:
-            if dr is not None:
-                st.caption(f"Intersection date range: {dr[0].date()} to {dr[1].date()}")
+            st.caption(f"Filtered by user range: {day1} to {returned}")
 
-            with st.expander("Preview: Activities", expanded=True):
-                st.dataframe(act_df.head(20), use_container_width=True)
+        with st.expander("Preview: Activities", expanded=True):
+            st.dataframe(act_df.head(50), use_container_width=True)
 
-            with st.expander("Preview: Sleep", expanded=False):
-                st.dataframe(slp_df.head(20), use_container_width=True)
+        with st.expander("Preview: Sleep", expanded=False):
+            st.dataframe(slp_df.head(50), use_container_width=True)
 
-            st.download_button(
-                "Download CSV",
-                data=out_bytes,
-                file_name="fitbit_to_garmin_activities_and_sleep.csv",
-                mime="text/csv",
-            )
+        pid = _sanitize_filename_part(participant_id)
+        file_name = f"Fitbit_{pid}_{day1.isoformat()}_{returned.isoformat()}.csv"
+
+        st.download_button(
+            "Download CSV",
+            data=out_bytes,
+            file_name=file_name,
+            mime="text/csv",
+        )
 
     except Exception as e:
         st.error(str(e))
