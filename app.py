@@ -464,6 +464,8 @@ def _sanitize_filename_part(s: str) -> str:
 # -----------------------
 st.set_page_config(page_title="Fitbit Takeout → CSV", layout="centered")
 st.title("Fitbit Takeout → CSV")
+st.sidebar.text("Author: Zihao Wang")
+st.sidebar.markdown("[GitHub](https://github.com/zionwzz)")
 
 with st.form("inputs", clear_on_submit=False):
     participant_id = st.text_input("Participant ID", value="")
