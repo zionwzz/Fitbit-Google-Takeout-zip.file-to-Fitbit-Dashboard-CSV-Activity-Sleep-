@@ -38,8 +38,6 @@ source .venv/bin/activate
 pip install -r requirement.txt
 ```
 
-> Note: the repo currently uses **`requirement.txt`** (singular) instead of the more common `requirements.txt`.
-
 ### 2) Run the Streamlit app
 
 ```bash
@@ -48,24 +46,6 @@ streamlit run app.py
 
 Streamlit will print a local URL (usually `http://localhost:8501`). Open it in your browser.
 
----
-
-## Getting your Fitbit data ZIP (Google Takeout)
-
-1. Go to **Google Takeout** (takeout.google.com)
-2. Deselect all products, then select **Fitbit**
-3. Click **Next step**
-4. Choose export format **.zip**
-5. Create the export and download the ZIP when it’s ready
-
-### If Google gives you multiple ZIP files
-
-This app accepts **one** ZIP upload.
-
-If Takeout splits your export into multiple ZIPs, combine them into a single ZIP by:
-
-1. Extracting all ZIP parts into **one** folder (so the internal `Takeout/` structure merges)
-2. Re-zipping that combined folder into a single ZIP
 
 ---
 
