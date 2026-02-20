@@ -67,7 +67,7 @@ Inside the uploaded ZIP, the app expects Fitbit “Global Export Data” JSON fi
    - **Day1 Set up / Start Date**
    - **Box Returned Date**
 3. Choose whether to:
-   - ✅ **Keep only intersection date range across domains** (recommended for clean day-by-day datasets)
+   - **Keep only intersection date range across domains** (always recommended for person-specific export task)
 4. Upload your Takeout `.zip`
 5. Click **Process**
 6. Preview the generated tables and click **Download CSV**
